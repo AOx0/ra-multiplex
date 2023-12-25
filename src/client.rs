@@ -2,7 +2,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 
 use anyhow::{bail, ensure, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::BufReader;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -368,6 +368,25 @@ fn tag_id(port: u16, id: &RequestId) -> RequestId {
     })
 }
 
+async fn close_open_files(files: &std::collections::HashSet<String>, instance: Arc<Instance>) {
+    for file in files {
+        debug!("Closing file: {file}");
+
+        let message = Message::Notification(jsonrpc::Notification {
+            jsonrpc: Version,
+            method: "textDocument/didClose".to_string(),
+            params: json!({
+                "textDocument": { "uri": file }
+            }),
+        });
+
+        if let Err(e) = instance.send_message(message).await {
+            error!("Error while closing files: {e:?}");
+        }
+        instance.keep_alive();
+    }
+}
+
 /// Read messages from client output socket and send them to the server channel
 async fn output_task(
     mut reader: LspReader<BufReader<OwnedReadHalf>>,
@@ -375,11 +394,14 @@ async fn output_task(
     instance: Arc<Instance>,
     close_tx: mpsc::Sender<Message>,
 ) {
+    let mut open_files = std::collections::HashSet::new();
+
     loop {
         let message = match reader.read_message().await {
             Ok(Some(message)) => message,
             Ok(None) => {
                 debug!("client output closed");
+                close_open_files(&open_files, instance.clone()).await;
                 break;
             }
             Err(err) => {
@@ -393,7 +415,9 @@ async fn output_task(
                 // Client requested the server to shut down but other clients might still be connected.
                 // Instead we disconnect this client to prevent the editor hanging
                 // see <https://github.com/pr2502/ra-multiplex/issues/5>.
-                info!("client sent shutdown request, sending a response and closing connection");
+                info!("client sent shutdown request, closing files, sending a response and closing connection");
+                close_open_files(&open_files, instance.clone()).await;
+
                 // <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#shutdown>
                 let message = Message::ResponseSuccess(ResponseSuccess {
                     jsonrpc: Version,
@@ -418,6 +442,31 @@ async fn output_task(
             }
 
             Message::Notification(notif) => {
+                if notif.method == "textDocument/didOpen" {
+                    open_files.insert(
+                        notif
+                            .params
+                            .get("textDocument")
+                            .and_then(|o| o.get("uri"))
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                    debug!("+files: {open_files:?}")
+                } else if notif.method == "textDocument/didClose" {
+                    open_files.remove(
+                        notif
+                            .params
+                            .get("textDocument")
+                            .and_then(|o| o.get("uri"))
+                            .unwrap()
+                            .as_str()
+                            .unwrap(),
+                    );
+                    debug!("-files: {open_files:?}")
+                }
+
                 if instance.send_message(notif.into()).await.is_err() {
                     break;
                 }
